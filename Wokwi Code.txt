@@ -1,0 +1,202 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "NMEA.h"
+#include <Wire.h>
+#include "RTClib.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "WebSocketClient.h"
+
+// --- WiFi Credentials ---
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+// --- Firebase ---
+const char* FIREBASE_HOST = "https://ev-monitor-5b17d-default-rtdb.asia-southeast1.firebasedatabase.app/";
+const char* FIREBASE_AUTH = "OiYXET1kwwZFp8FQIYUGeH7z7P4ANd74PxpNrmLb";
+
+// --- Sensor Pins ---
+#define VOLTAGE_PIN        34
+#define CURRENT_PIN        35
+#define TEMP_PIN           32
+#define PRESSURE_POT_PIN   33
+#define RPM_POT_PIN        36
+#define TORQUE_POT_PIN     39
+#define MOTOR_TEMP_PIN     15
+
+// --- Encoder & Buttons ---
+const int encoderCLK = 25;
+const int encoderDT = 26;
+const int startButtonPin = 18;
+const int endButtonPin = 19;
+
+// --- WebSocket ---
+char serverAddress[] = "archocell.obaa.cloud";
+int port = 8181;
+char endpoint[] = "/echo";
+WiFiClient wifi;
+WebSocketClient wsClient(wifi, serverAddress, port);
+
+// --- GPS ---
+NMEA gps(ALL);
+union {
+  char bytes[4];
+  float valor;
+} velocidadeGPS;
+float latitude, longitude;
+
+// --- RTC ---
+RTC_DS1307 rtc;
+
+// --- Motor Temp Sensor ---
+OneWire oneWire(MOTOR_TEMP_PIN);
+DallasTemperature motorSensors(&oneWire);
+
+// --- States ---
+int lastEncoderState;
+int direction = 0;
+bool lastStartState = LOW, lastEndState = LOW;
+unsigned long lastSend = 0;
+const int interval = 300; // faster response
+String jsonMessage;
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+
+  pinMode(startButtonPin, INPUT);
+  pinMode(endButtonPin, INPUT);
+  pinMode(encoderCLK, INPUT);
+  pinMode(encoderDT, INPUT);
+
+  analogReadResolution(12);
+  Wire.begin(21, 22);
+  motorSensors.begin();
+
+  if (!rtc.begin()) {
+    Serial.println("RTC not found");
+    while (1);
+  }
+  if (!rtc.isrunning()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+
+  wsClient.begin(endpoint);
+  lastEncoderState = digitalRead(encoderCLK);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  while (Serial2.available()) {
+    char serialData = Serial2.read();
+    if (gps.decode(serialData)) {
+      velocidadeGPS.valor = (gps.gprmc_status() == 'A') ? gps.gprmc_speed(KMPH) : 0;
+      latitude = gps.gprmc_latitude();
+      longitude = gps.gprmc_longitude();
+
+      float voltageRaw = analogRead(VOLTAGE_PIN);
+      float currentRaw = analogRead(CURRENT_PIN);
+      float tempRaw = analogRead(TEMP_PIN);
+      float pressureRaw = analogRead(PRESSURE_POT_PIN);
+      float batteryVoltage = (voltageRaw / 4095.0) * 12.6;
+      float batteryCurrent = (currentRaw / 4095.0) * 10.0;
+      float batteryTemp = (tempRaw / 4095.0) * 100.0;
+      float tyrePressure = (pressureRaw / 4095.0) * 50.0;
+      float soc = ((batteryVoltage - 9.0) / (12.6 - 9.0)) * 100.0;
+      soc = constrain(soc, 0.0, 100.0);
+      float soh = constrain(95.0 + (soc / 100.0) * 5.0, 0.0, 100.0);
+      float rpm = map(analogRead(RPM_POT_PIN), 0, 4095, 0, 1200);
+      float torque = map(analogRead(TORQUE_POT_PIN), 0, 4095, 0, 70);
+      motorSensors.requestTemperatures();
+      float motorTemp = motorSensors.getTempCByIndex(0);
+
+      int currentEncoderState = digitalRead(encoderCLK);
+      if (currentEncoderState != lastEncoderState) {
+        direction += (digitalRead(encoderDT) != currentEncoderState) ? 1 : -1;
+        direction = constrain(direction, -1, 1);
+        lastEncoderState = currentEncoderState;
+      }
+
+      String chargingStatus = (direction == 0) ? "Not Charging" : "Charging";
+
+      jsonMessage = "{";
+      jsonMessage += "\"latitude\":" + String(latitude, 8) + ",";
+      jsonMessage += "\"longitude\":" + String(longitude, 8) + ",";
+      jsonMessage += "\"speed\":" + String(velocidadeGPS.valor) + ",";
+      jsonMessage += "\"current\":" + String(batteryCurrent, 2) + ",";
+      jsonMessage += "\"voltage\":" + String(batteryVoltage, 2) + ",";
+      jsonMessage += "\"temp\":" + String(batteryTemp, 2) + ",";
+      jsonMessage += "\"soc\":" + String(soc, 2) + ",";
+      jsonMessage += "\"soh\":" + String(soh, 2) + ",";
+      jsonMessage += "\"charging_status\":\"" + chargingStatus + "\",";
+      jsonMessage += "\"torque\":" + String(torque, 1) + ",";
+      jsonMessage += "\"rpm\":" + String(rpm, 1) + ",";
+      jsonMessage += "\"tyre_pressure\":" + String(tyrePressure, 1) + ",";
+      jsonMessage += "\"motor_temp\":" + String(motorTemp, 2);
+      jsonMessage += "}";
+
+      if (currentMillis - lastSend > interval) {
+        wsClient.beginMessage(TYPE_TEXT);
+        wsClient.print(jsonMessage);
+        wsClient.endMessage();
+        Serial.println("==== Vehicle Data ====");
+        Serial.println(jsonMessage);
+        Serial.println("======================");
+        sendToFirebase(jsonMessage);
+        lastSend = currentMillis;
+      }
+    }
+  }
+
+  checkButton(startButtonPin, lastStartState, "Start Time: ");
+  checkButton(endButtonPin, lastEndState, "End Time: ");
+}
+
+void checkButton(int pin, bool &lastState, const char* label) {
+  bool state = digitalRead(pin);
+  if (state == HIGH && lastState == LOW) {
+    delay(10);
+    if (digitalRead(pin) == HIGH) {
+      DateTime now = rtc.now();
+      Serial.print(label);
+      printDateTime(now);
+    }
+  }
+  lastState = state;
+}
+
+void printDateTime(DateTime dt) {
+  Serial.printf("%04d/%02d/%02d %02d:%02d:%02d\n",
+                dt.year(), dt.month(), dt.day(),
+                dt.hour(), dt.minute(), dt.second());
+}
+
+void sendToFirebase(const String& data) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    return;
+  }
+
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "?auth=" + FIREBASE_AUTH;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpResponseCode = http.PUT(data);
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Firebase Response: " + response);
+  } else {
+    Serial.print("Firebase Error: ");
+    Serial.println(http.errorToString(httpResponseCode));
+  }
+  http.end();
+}
