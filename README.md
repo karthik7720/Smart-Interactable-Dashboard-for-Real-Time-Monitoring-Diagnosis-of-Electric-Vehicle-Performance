@@ -55,6 +55,8 @@ This project involves the development of a smart dashboard for real-time monitor
 ![Web 3](https://github.com/user-attachments/assets/cfdf2068-edcd-4ccb-a163-f9de9502d8d3)
 
 
+https://smartevdiagnosticsystem.netlify.app/
+
 
 * Real-time data from the vehicle is sent to Firebase through the ESP32.
 * Web dashboard retrieves and visualizes data using Firebase SDK, displaying critical metrics like speed, temperature, battery status, and GPS location.
